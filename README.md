@@ -1,5 +1,7 @@
 <div align="center">
 
+**English** | **[繁體中文](README.zh-TW.md)**
+
 <img src="web/public/logo.svg" width="84" alt="ARTEX logo" />
 
 # ARTEX
