@@ -40,12 +40,17 @@ import (
 // messages API (the web_search_20250305 server tool), so each search consumes one
 // model call, and the search request is issued by DeepSeek's servers — it does NOT
 // go through the local Proxy, nor into the traffic recording.
+// KeenableSearchTitle is the X-Keenable-Title value ARTEX sends. Fixed in v1:
+// the title identifies the calling application to the provider.
+const KeenableSearchTitle = "ARTEX"
+
 type WebSearchOpts struct {
-	Enabled   bool
-	Backend   string
-	BraveKey  string
-	TavilyKey string
-	Proxy     string
+	Enabled     bool
+	Backend     string
+	BraveKey    string
+	TavilyKey   string
+	KeenableKey string
+	Proxy       string
 	// DeepSeek* comes from the currently active LLM config (only the official
 	// DeepSeek endpoint in anthropic format) — not configured separately; it follows
 	// the LLM config switch.
@@ -382,6 +387,21 @@ func renderWorkerGraphOverview(data map[string]any, env dataEnvelope) string {
 		sections
 }
 
+// writeIntentAutoScope records the intent's target assets as auto scope when
+// coverage is on. coverageEnabled is fail-open: a failed flag read is true, so
+// an outage still writes, including when the stored flag is off.
+func writeIntentAutoScope(as *db.AssetStore, taskID int64, assets []*db.Asset, coverageEnabled bool) {
+	if as == nil || !coverageEnabled {
+		return
+	}
+	for _, a := range assets {
+		if a == nil {
+			continue
+		}
+		_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
+	}
+}
+
 // Execute runs one intent. hooks (the per-task Guard) gates every tool call; may
 // be nil. emit, if non-nil, receives one ActivityRecord per execution step.
 // notifyFinding, if non-nil, is called (intentID, summary) when this worker writes
@@ -407,7 +427,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
 	tsx.SetTaskID(taskID)
-	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
+	coverageEnabled := coverageOn(as, taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
@@ -468,12 +488,9 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 				// toward coverage only under a declared domain or IP root (db.declaredScopeFilter);
 				// coverage scope, not enforced.
 				// When the asset-coverage feature is off, the test scope (denominator) is no
-				// longer accumulated.
-				if coverageEnabled {
-					for _, a := range assets {
-						_ = as.AddAutoScope(taskID, a.Type, a.Domain, a.URL, a.IP)
-					}
-				}
+				// longer accumulated. A failed flag read is treated as on, so an outage
+				// still writes, including for a task whose stored flag is off.
+				writeIntentAutoScope(as, taskID, assets, coverageEnabled)
 			}
 		}
 	}
@@ -505,6 +522,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		WebSearchBackend:      w.webSearch.Backend,
 		BraveSearchAPIKey:     w.webSearch.BraveKey,
 		TavilySearchAPIKey:    w.webSearch.TavilyKey,
+		KeenableSearchAPIKey:  w.webSearch.KeenableKey,
+		KeenableSearchTitle:   KeenableSearchTitle,
 		DeepSeekSearchBaseURL: w.webSearch.DeepSeekBaseURL,
 		DeepSeekSearchAPIKey:  w.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   w.webSearch.DeepSeekModel,
