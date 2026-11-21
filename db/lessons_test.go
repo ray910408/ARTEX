@@ -76,7 +76,7 @@ func TestRenderLessonsUsageOmitsTruncated(t *testing.T) {
 func TestTaskLessonsUsesTaskScopeAndRanksCompanyFirst(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -174,7 +174,7 @@ func TestTaskLessonsUsesTaskScopeAndRanksCompanyFirst(t *testing.T) {
 func TestExtractLessonsScopesSingleCompanyFromTaskScope(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -191,11 +191,14 @@ func TestExtractLessonsScopesSingleCompanyFromTaskScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { cleanupErr(t, "extract task", d.DeleteTask(task.ID)) })
-	if _, err := d.Exec(`
+	var extractedFID int64
+	if err := d.QueryRow(`
 		INSERT INTO findings(task_id,vulnclass,name,summary,severity,status)
-		VALUES ($1,'xss','Reflected XSS','reflected in search','high','confirmed')`, task.ID); err != nil {
+		VALUES ($1,'xss','Reflected XSS','reflected in search','high','confirmed')
+		RETURNING id`, task.ID).Scan(&extractedFID); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, extractedFID) })
 	n, err := d.ExtractLessonsForTask(t.Context(), task.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +229,7 @@ func TestExtractLessonsScopesSingleCompanyFromTaskScope(t *testing.T) {
 func TestExtractLessonsSkipsMultiCompanyTask(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -273,7 +276,7 @@ func TestExtractLessonsSkipsMultiCompanyTask(t *testing.T) {
 func TestExtractLessonsGenericWhenTaskHasNoCompany(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -311,7 +314,7 @@ func TestExtractLessonsGenericWhenTaskHasNoCompany(t *testing.T) {
 func TestTaskLessonsRanksCategoryBeforeGeneric(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -377,7 +380,7 @@ func TestTaskLessonsRanksCategoryBeforeGeneric(t *testing.T) {
 func TestLogLessonUsageRecordsOnlyRendered(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -457,7 +460,7 @@ func insertLessonFinding(t *testing.T, d *DB, taskID int64, status string) int64
 func TestExtractLessonsRetractsReversedDisposition(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -477,6 +480,7 @@ func TestExtractLessonsRetractsReversedDisposition(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&fid); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 
 	n, err := d.ExtractLessonsForTask(t.Context(), task.ID)
 	if err != nil {
@@ -569,7 +573,7 @@ func TestExtractLessonsRetractsReversedDisposition(t *testing.T) {
 func TestExtractLessonsRetireOnlyWhenLastEvidence(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -589,12 +593,14 @@ func TestExtractLessonsRetireOnlyWhenLastEvidence(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&aID); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, aID) })
 	if err := d.QueryRow(`
 		INSERT INTO findings(task_id,vulnclass,name,summary,severity,status)
 		VALUES ($1,$2,'Reflected XSS',$3,'high','confirmed')
 		RETURNING id`, task.ID, cue, label).Scan(&bID); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, bID) })
 
 	if _, err := d.ExtractLessonsForTask(t.Context(), task.ID); err != nil {
 		t.Fatal(err)
@@ -660,7 +666,7 @@ func TestExtractLessonsRetireOnlyWhenLastEvidence(t *testing.T) {
 func TestExtractLessonsRetractsAllRetests(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -680,6 +686,7 @@ func TestExtractLessonsRetractsAllRetests(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&fid); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 
 	r1 := insertLessonRetest(t, d, fid, "reproduced")
@@ -731,7 +738,7 @@ func TestExtractLessonsRetractsAllRetests(t *testing.T) {
 func TestExtractLessonsDoesNotUnretireWithEvidence(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -751,6 +758,7 @@ func TestExtractLessonsDoesNotUnretireWithEvidence(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&fid); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 
 	if _, err := d.ExtractLessonsForTask(t.Context(), task.ID); err != nil {
@@ -777,7 +785,7 @@ func TestExtractLessonsDoesNotUnretireWithEvidence(t *testing.T) {
 func TestExtractLessonsLeavesAdopted(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -797,6 +805,7 @@ func TestExtractLessonsLeavesAdopted(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&fid); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 
 	if _, err := d.ExtractLessonsForTask(t.Context(), task.ID); err != nil {
@@ -820,7 +829,7 @@ func TestExtractLessonsLeavesAdopted(t *testing.T) {
 func TestExtractLessonsReopenRetractsNothing(t *testing.T) {
 	d, err := Open(testDSN(t))
 	if err != nil {
-		t.Skipf("postgres unavailable (%v) — skipping", err)
+		SkipPGUnavailable(t, err)
 	}
 	t.Cleanup(func() { d.Close() })
 
@@ -840,6 +849,7 @@ func TestExtractLessonsReopenRetractsNothing(t *testing.T) {
 		RETURNING id`, task.ID, cue, label).Scan(&fid); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 	t.Cleanup(func() { cleanupExec(t, d, `DELETE FROM findings WHERE id=$1`, fid) })
 
 	if _, err := d.ExtractLessonsForTask(t.Context(), task.ID); err != nil {
