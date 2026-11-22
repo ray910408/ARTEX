@@ -67,6 +67,7 @@ type Worker struct {
 	workDir         string
 	proxyAddr       string
 	proxyCACert     string            // recording proxy's CA cert path (for WebFetch HTTPS verify)
+	factTraffic     FactTrafficLookup // proxy captures for fact provenance (nil = activity-only)
 	webSearch       WebSearchOpts     // web_search tool backend selection (off by default)
 	tx              *transcript.Store // raw LLM conversation persistence (nil = off)
 	window          int               // context window in tokens (for compaction)
@@ -205,6 +206,10 @@ func (w *Worker) compactionWindow() int {
 // traffic through, plus the CA cert path WebFetch trusts to verify HTTPS through
 // that MITM proxy. Empty addr disables the hint.
 func (w *Worker) SetProxy(addr, caCert string) { w.proxyAddr, w.proxyCACert = addr, caCert }
+
+// SetFactTraffic wires the proxy capture store used to classify recorded facts
+// (#124 row 1). nil keeps the activity-only classification.
+func (w *Worker) SetFactTraffic(l FactTrafficLookup) { w.factTraffic = l }
 
 // SetWebSearch selects the web_search backend for this worker (off by default).
 func (w *Worker) SetWebSearch(o WebSearchOpts) { w.webSearch = o }
@@ -527,6 +532,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetFactTraffic(w.factTraffic)
 	tsx.SetTaskID(taskID)
 	coverageEnabled := coverageOn(as, taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
@@ -568,20 +574,26 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
-	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), newDataEnvelope())
+	workerEnv := newDataEnvelope()
+	overview := renderWorkerGraphOverview(tsx.graphOverviewData(), workerEnv)
 	staticPart, dynamicTail := workerSystemParts(w.proxyAddr, w.proxyCACert, w.workDir, runDir)
 	dynamicTail += frameLessonsBlock(w.lessonsBlock)
 	if w.wantConstraints() {
 		dynamicTail += constraintBlock(ts) // inject the operation constraints (if any) into the system prompt; the worker strictly obeys them during execution
 	}
-	// intent block → intent-anchored assets block → launch instruction, appended to
-	// the system tail in that order (same append pattern as constraintBlock).
+	// intent block → launch instruction in the system tail; intent-anchored assets
+	// carry target-influenced fields (PageTitle, Description, etc.) and go into
+	// the launch user message inside workerEnv's data envelope (#124).
 	dynamicTail += renderIntentTask(intent)
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {
-				if b, err := json.Marshal(assets); err == nil {
-					dynamicTail += "\n\nThe target assets corresponding to this intent's asset_ids:\n" + string(b)
+				if block := renderWorkerIntentAssets(assets, workerEnv); block != "" {
+					if strings.TrimSpace(overview) == "" {
+						overview = workerEnv.intro() + block
+					} else {
+						overview += block
+					}
 				}
 				// The assets this intent explicitly targets → automatically join the task's
 				// test scope (same conservative granularity as insertAssets). upsertTaskScope's

@@ -5,6 +5,10 @@
   "-1 = no rerun; the intent is marked blocked outright": "-1 = 不重跑，该意图直接判为 blocked",
   "-1 = no retries at all; the failure bubbles up immediately": "-1 = 一次都不重试，失败立刻上抛",
   "-1 = transient failures never trip (deterministic failures still do)": "-1 = 瞬时失败永不熔断（确定性失败仍然熔断）",
+  "Downloading and verifying": "正在下载并校验",
+  "Local storage": "本地存储",
+  "Object storage": "对象存储",
+  "Uploading and verifying": "正在上传并校验",
   "— (task deleted)": "—（任务已删除）",
   "— agent generates —": "— 由智能体生成 —",
   "… {count} errors in total": "…共 {count} 个错误",
@@ -307,7 +311,7 @@
   "Archived": "已归档",
   "Archived at": "归档时间",
   "Archiving": "归档中",
-  "Archiving stops task scheduling and compresses the graph, LLM history, files, and exclusive assets and traffic into local cold storage. Once archived, a task can be restored from \"Archived\".": "归档会停止任务调度，将图谱、LLM 历史、文件以及独占资产和流量压缩到本地冷存储。归档完成后可从“已归档”中还原。",
+  "Archiving stops task scheduling and compresses the graph, LLM history, files, and exclusive assets and traffic into the configured archive storage. Once archived, a task can be restored from \"Archived\". Restoring requires free space on this server.": "归档会停止任务调度，将图谱、LLM 历史、文件以及独占资产和流量压缩到已配置的归档存储中。归档完成后可从“已归档”中还原。还原需要此服务器有足够的可用空间。",
   "Are you sure you want to delete asset interception rule \"{pattern}\"?": "确定删除资产拦截规则“{pattern}”？",
   "Arguments": "参数",
   "Arguments (space-separated)": "参数（空格分隔）",
@@ -2705,5 +2709,9 @@
   "Hashes": "哈希",
   "Masked (HMAC)": "已脱敏 (HMAC)",
   "Resulting request": "结果请求",
-  "Resulting response": "结果响应"
+  "Resulting response": "结果响应",
+  "Traffic capture is off by default. Enable it in System settings after setup if you need provable HTTP findings — captured traffic is required for findings to prove goals.": "流量捕获默认关闭。如需可证明的 HTTP 漏洞发现，请在初始化后前往系统设置开启——漏洞证明目标需要已捕获的 HTTP 流量。",
+  "Capture is off · required for provable findings": "捕获已关闭 · 可证明漏洞所需",
+  "Traffic capture is off: findings stay recorded, but captured HTTP traffic is required for provable findings.": "流量捕获已关闭：漏洞仍会被记录，但证明目标需要已捕获的 HTTP 流量。",
+  "Enable in settings": "前往设置开启"
 }
