@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/archivestore"
@@ -55,7 +56,8 @@ type Server struct {
 
 	scrubSecrets bool // drop ARTEX_PG_DSN and the API keys from the environment once read (binary only)
 
-	execPriv ExecPrivilege // identity agent processes run under; zero keeps the server's own
+	execPriv  ExecPrivilege   // identity agent processes run under; zero keeps the server's own
+	isolation IsolationStatus // result of the startup isolation self-test (isolation.go); zero when not run
 
 	setupMu    sync.Mutex
 	setupToken string // one-time token POST /api/auth/init requires; empty when none is active
@@ -431,6 +433,7 @@ func (s *Server) loadLLMConfig() (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	// Ollama profiles run keyless (local server); the other formats need a key.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
@@ -459,9 +462,15 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 	var sessionHeaderKey string
 	var userAgent string
 	var retry db.RetryOverride
+	clearCustomHeaders := format != "bedrock-gateway"
 	if profs, _ := s.m.pg.ListProfiles(); profs != nil {
 		for _, p := range profs {
 			if p.Name == "default" {
+				// A header saved for one gateway must not follow the legacy
+				// endpoint's default profile to another destination.
+				if !sameLLMEndpoint(format, cfg.BaseURL, p.Format, p.BaseURL) {
+					clearCustomHeaders = true
+				}
 				id, priority, poolExclude, streaming = p.ID, p.Priority, p.PoolExclude, p.Streaming
 				maxTokens, maxTokensField = p.MaxTokens, p.MaxTokensField
 				sessionHeaderKey = p.SessionHeaderKey
@@ -477,7 +486,7 @@ func (s *Server) saveLLMConfig(cfg agent.Config) error {
 		ContextWindowK: cfg.ContextWindowK, ThinkingType: cfg.ThinkingType, ReasoningEffort: cfg.ReasoningEffort, IsDefault: true,
 		Priority: priority, PoolExclude: poolExclude, Streaming: streaming,
 		MaxTokens: maxTokens, MaxTokensField: maxTokensField, SessionHeaderKey: sessionHeaderKey, UserAgent: userAgent,
-		Retry: retry,
+		Retry: retry, CustomHeaders: cfg.CustomHeaders, ClearCustomHeaders: clearCustomHeaders,
 	})
 	if err != nil {
 		return err
@@ -610,6 +619,7 @@ func (s *Server) loadProfileConfig(id int64) (agent.Config, bool) {
 	cfg.MaxTokens, cfg.MaxTokensField = p.MaxTokens, p.MaxTokensField
 	cfg.SessionHeaderKey = p.SessionHeaderKey
 	cfg.UserAgent = p.UserAgent
+	cfg.CustomHeaders = p.CustomHeaders
 	s.applyProfileRetry(&cfg, p)
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		return cfg, false
@@ -1100,6 +1110,10 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := map[string]any{"ok": true, "service": "artex", "version": BuildVersion}
+	// The web UI shows a banner on every page for a degraded isolation (isolation.go).
+	if s.isolation.Mode != "" {
+		out["isolation"] = s.isolation
+	}
 	// Opt-in only (ARTEX_UPDATE_CHECK); off, this returns "" without any request.
 	if latest := updates.newerVersion(r.Context(), time.Now(), BuildVersion); latest != "" {
 		out["latest_version"] = latest
@@ -1493,6 +1507,7 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 		ContextWindowK  int     `json:"context_window_k"`
 		ThinkingType    string  `json:"thinking_type"`
 		ReasoningEffort string  `json:"reasoning_effort"`
+		CustomHeaders   string  `json:"custom_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1507,18 +1522,26 @@ func (s *Server) setLLM(w http.ResponseWriter, r *http.Request) {
 	cfg.RatePerSecond, cfg.RatePerMinute = req.RatePerSecond, req.RatePerMinute
 	cfg.ThinkingType = req.ThinkingType
 	cfg.ReasoningEffort = req.ReasoningEffort
+	cfg.CustomHeaders = req.CustomHeaders
 	if k := req.ContextWindowK; k > 0 { // 0 = keep default (200K); cap at 1M
 		if k > 1000 {
 			k = 1000
 		}
 		cfg.ContextWindowK = k
 	}
-	// Keyless formats (Ollama) need no key; the others keep/require one.
-	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
-		s.cfgMu.Lock()
-		cfg.APIKey = s.llmCfg.APIKey // keep existing key if not re-entered
-		s.cfgMu.Unlock()
+	// A rotated token at the same gateway still uses that gateway's saved
+	// headers. Neither secret follows a changed endpoint.
+	s.cfgMu.Lock()
+	if sameLLMEndpoint(req.Provider, req.BaseURL, s.llmCfg.Provider(), s.llmCfg.BaseURL) {
+		if cfg.APIKey == "" && cfg.NeedsAPIKey() {
+			cfg.APIKey = s.llmCfg.APIKey
+		}
+		if cfg.CustomHeaders == "" && cfg.Format == agent.FormatBedrockGateway {
+			cfg.CustomHeaders = s.llmCfg.CustomHeaders
+		}
 	}
+	s.cfgMu.Unlock()
+	// Keyless formats (Ollama) need no key; the others keep/require one.
 	if cfg.APIKey == "" && cfg.NeedsAPIKey() {
 		writeErr(w, 400, "api_key required")
 		return
@@ -1559,6 +1582,7 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		Streaming        *bool  `json:"streaming"`          // omitted = streaming, the same defaults as when saving a profile
 		SessionHeaderKey string `json:"session_header_key"` // non-empty = the test also sends this custom session header, with a one-off random session id as the value
 		UserAgent        string `json:"user_agent"`         // non-empty = the test overrides the User-Agent header with this value (mirrors production)
+		CustomHeaders    string `json:"custom_headers"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
@@ -1640,6 +1664,14 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cfg.UserAgent = ua
+	cfg.CustomHeaders = req.CustomHeaders
+	if stored != nil && cfg.CustomHeaders == "" && sameLLMEndpoint(req.Provider, req.BaseURL, stored.Format, stored.BaseURL) {
+		cfg.CustomHeaders = stored.CustomHeaders
+	}
+	if _, err := agent.ParseBedrockGatewayHeaders(cfg.CustomHeaders); err != nil {
+		writeErr(w, 400, err.Error())
+		return
+	}
 	// Keyless formats (Ollama) skip the key resolution entirely.
 	if cfg.NeedsAPIKey() {
 		// API key resolution precedence: form input > the named profile's stored key > the global config's key.
@@ -1665,6 +1697,9 @@ func (s *Server) testLLM(w http.ResponseWriter, r *http.Request) {
 			if global.APIKey != "" {
 				if sameLLMEndpoint(req.Provider, req.BaseURL, global.Provider(), global.BaseURL) {
 					cfg.APIKey = global.APIKey
+					if cfg.CustomHeaders == "" {
+						cfg.CustomHeaders = global.CustomHeaders
+					}
 				} else {
 					withheld = true
 				}
@@ -1911,11 +1946,33 @@ var (
 	reDomain = regexp.MustCompile(`\b((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})(?::(\d{1,5}))?`)
 )
 
+// trimURLTail drops sentence punctuation that free text puts after a URL
+// ("Assess http://host:3000."). A closing bracket is dropped only when it has no
+// opener in the URL, so "http://[::1]" keeps its "]".
+func trimURLTail(s string) string {
+	for s != "" {
+		r, size := utf8.DecodeLastRuneInString(s)
+		switch r {
+		case '.', ',', ';', ':', '!', '?', '。', '，', '、', '；', '：', '！', '？', '”', '’':
+		case ')', ']', '}', '>':
+			open := string("([{<"[strings.IndexRune(")]}>", r)])
+			if strings.Count(s, open) >= strings.Count(s, string(r)) {
+				return s
+			}
+		default:
+			return s
+		}
+		s = s[:len(s)-size]
+	}
+	return s
+}
+
 // parseTarget extracts a target (scheme, host, port) from free text, supporting
 // full URLs, IP[:port] and domain[:port]. ok=false when nothing parseable.
 func parseTarget(text string) (scheme, host string, port int, ok bool) {
 	text = strings.TrimSpace(text)
 	if m := reURL.FindString(text); m != "" {
+		m = trimURLTail(m)
 		if u, err := url.Parse(m); err == nil && u.Hostname() != "" {
 			scheme = strings.ToLower(u.Scheme)
 			host = strings.ToLower(u.Hostname())
@@ -3715,6 +3772,7 @@ func (s *Server) getTrafficExchange(w http.ResponseWriter, r *http.Request) {
 // getTrafficStream returns one page of a WebSocket/SSE exchange's messages in
 // order (limit 1..200, default 50). direction=c2s or s2c keeps one side of the
 // conversation (plus the meta limit marker); any other non-empty value is a 400.
+// total counts rows for pagination; message_total excludes meta limit markers.
 func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	tr := s.m.Traffic()
 	if tr == nil {
@@ -3730,7 +3788,7 @@ func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(q.Get("offset"))
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	direction := strings.ToLower(strings.TrimSpace(q.Get("direction")))
-	msgs, total, err := tr.StreamMessagesByDirection(id, direction, offset, limit)
+	page, err := tr.StreamMessagePageByDirection(id, direction, offset, limit)
 	if errors.Is(err, traffic.ErrBadStreamDirection) {
 		writeErr(w, 400, err.Error())
 		return
@@ -3739,7 +3797,7 @@ func (s *Server) getTrafficStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"items": msgs, "total": total})
+	writeJSON(w, 200, page)
 }
 
 // maxReplayRequestBytes bounds the replay request body (JSON, with the payload
@@ -3862,6 +3920,8 @@ func (s *Server) settingsPayload() map[string]any {
 	return map[string]any{
 		"traffic_capture":          s.m.TrafficEnabled(),
 		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
+		"triage_profile_id":        s.triageProfileID(),
+		"triage_min_confidence":    s.triageMinConfidence(),
 		"llm_record":               s.m.LLMRecordEnabled(),
 		"web_search_enabled":       on,
 		"web_search_backend":       backend,
@@ -3963,6 +4023,14 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// operation-constraint injection scope switches (default both on); take effect immediately (planner/worker read them every round), no agent rebuild needed.
 		ConstraintsInjectPlanner *bool `json:"constraints_inject_planner"`
 		ConstraintsInjectWorker  *bool `json:"constraints_inject_worker"`
+		// Triage profile: an llm_profiles row serving the decision-model (/v1/systemone)
+		// contract, used for closed-list judgements (report_finding dedup). 0/null-safe:
+		// omit = keep, 0 = off. Read per agent run, so it applies to runs started afterwards.
+		TriageProfileID *int64 `json:"triage_profile_id"`
+		// Suppression threshold for a duplicate answer (0..1). Lower catches more real
+		// duplicates and risks suppressing a distinct one; the caller is told to
+		// re-register in that case, which is what makes the low end affordable.
+		TriageMinConfidence *float64 `json:"triage_min_confidence"`
 		// Experimental: noa context compaction switch (default off); read per run, applies to runs started afterwards, no agent rebuild needed.
 		NoaCompaction *bool `json:"noa_compaction"`
 		// Vulnerability IM push global settings. The delivery engine re-reads all three every round, so changes
@@ -3994,6 +4062,26 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		egress.SetProfile(noise)
 	}
+	// Triage settings are checked before either is stored. A profile id that does
+	// not exist resolves to "off" at run time, which reads as a broken dedup rather
+	// than as a rejected setting; a threshold outside 0..1 is silently ignored by
+	// the agent. Reject both here instead of storing them.
+	if req.TriageProfileID != nil {
+		if *req.TriageProfileID < 0 {
+			writeErr(w, 400, "triage_profile_id must be >= 0 (0 turns the duplicate check off)")
+			return
+		}
+		if *req.TriageProfileID > 0 {
+			if p, err := s.m.pg.ProfileByID(*req.TriageProfileID); err != nil || p == nil {
+				writeErr(w, 400, fmt.Sprintf("triage_profile_id %d does not match any LLM profile", *req.TriageProfileID))
+				return
+			}
+		}
+	}
+	if req.TriageMinConfidence != nil && (*req.TriageMinConfidence < 0 || *req.TriageMinConfidence > 1) {
+		writeErr(w, 400, "triage_min_confidence must be between 0 and 1")
+		return
+	}
 	// A masked placeholder echoed back keeps the stored secret, like null.
 	req.BraveKey, req.TavilyKey, req.KeenableKey = keepIfMasked(req.BraveKey), keepIfMasked(req.TavilyKey), keepIfMasked(req.KeenableKey)
 	req.WebSearchProxy, req.GlobalProxy = keepIfMasked(req.WebSearchProxy), keepIfMasked(req.GlobalProxy)
@@ -4005,6 +4093,19 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ConstraintsInjectWorker != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectWorker, *req.ConstraintsInjectWorker); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
+	if req.TriageMinConfidence != nil {
+		if err := s.m.pg.SetSetting(settingTriageMinConfidence, strconv.FormatFloat(*req.TriageMinConfidence, 'f', 3, 64)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		s.applyTriageThreshold()
+	}
+	if req.TriageProfileID != nil {
+		if err := s.m.pg.SetSetting(settingTriageProfile, strconv.FormatInt(*req.TriageProfileID, 10)); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}
